@@ -46,16 +46,34 @@ MODELS = {
         "size_mb": 1500,
         "description": "Whisper Medium (English only) - High accuracy, requires 8GB+ RAM",
     },
-    # Multilingual models
+    # Multilingual models (English + Chinese, language auto-detect)
     "ggml-small.bin": {
         "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin",
         "size_mb": 466,
-        "description": "Whisper Small (Multilingual) - Recommended for non-English content",
+        "description": "Whisper Small (Multilingual) - Light, decent for non-English content",
+    },
+    "ggml-medium.bin": {
+        "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin",
+        "size_mb": 1500,
+        "description": "Whisper Medium (Multilingual) - Precise dialogue detection for English + Chinese, needs 8GB+ RAM (OOMs on 16GB when Ollama qwen3:8b is loaded; use small)",
+    },
+    "ggml-large-v3-turbo.bin": {
+        "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin",
+        "size_mb": 1600,
+        "description": "Whisper Large V3 Turbo (Multilingual) - Near-best accuracy for English + Chinese, faster than full large",
+    },
+    "ggml-large-v3.bin": {
+        "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin",
+        "size_mb": 3000,
+        "description": "Whisper Large V3 (Multilingual) - Maximum accuracy, requires 12GB+ RAM, slowest on CPU",
     },
 }
 
-# Default models to download
-DEFAULT_MODELS = ["blaze_face_short_range.tflite", "ggml-small.en.bin"]
+# Default models to download (the active multilingual small model + face detection).
+# NOTE: we use ggml-small.bin (466MB) — NOT medium — because Whisper-medium
+# OOM-crashed this 16GB machine (~1.5GB file + ~3GB runtime while Ollama
+# qwen3:8b is also resident). small still does English+Chinese auto-detect.
+DEFAULT_MODELS = ["blaze_face_short_range.tflite", "ggml-small.bin"]
 
 
 def _progress_hook(block_num: int, block_size: int, total_size: int) -> None:

@@ -62,6 +62,13 @@ class SubtitleFormat(str, enum.Enum):
     BURNED = "burned"
 
 
+class VoiceOverStatus(str, enum.Enum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
 class Platform(str, enum.Enum):
     YOUTUBE = "youtube"
     FACEBOOK = "facebook"
@@ -133,6 +140,13 @@ class Video(Base):
     status = Column(Enum(VideoStatus), default=VideoStatus.PENDING, nullable=False, index=True)
     processing_progress = Column(Integer, default=0)  # 0-100 percentage
     processing_step = Column(String(100), nullable=True)  # Current step name
+    current_stage = Column(String(50), nullable=True)  # Machine-readable active stage key (e.g. "transcription")
+    stage_progress = Column(Integer, nullable=True)    # 0-100 progress within the current stage; NULL=indeterminate
+    source_url = Column(String(2000), nullable=True)  # Original shareable URL (YouTube/FB)
+    source_video_id = Column(String(200), nullable=True, index=True)  # Platform source ID (yt-dlp id) extracted from URL, for dedup
+    content_hash = Column(String(64), nullable=True)  # SHA-256 of the source file bytes, for upload dedup
+    content_type = Column(String(50), nullable=True)   # podcast, interview, tutorial, vlog, etc.
+    content_density = Column(String(20), nullable=True) # low, medium, high
     error_message = Column(Text, nullable=True)
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
@@ -194,15 +208,30 @@ class Clip(Base):
     start_time = Column(Float, nullable=False)
     end_time = Column(Float, nullable=False)
     duration = Column(Float, nullable=False)
+    # ACTUAL start/end the rendered clip lands on in the source video. The
+    # pipeline cuts with ``-c copy`` (input seeking), so FFmpeg snaps to the
+    # LAST KEYFRAME at or before ``start_time``, making the real clip start a
+    # little EARLIER than requested.  We rebase subtitles against THIS value,
+    # never the requested one, or captions land early by the keyframe offset.
+    achieved_start_time = Column(Float, nullable=True)
+    achieved_end_time = Column(Float, nullable=True)
     total_score = Column(Float, nullable=True)
     score_breakdown_json = Column(JSON, nullable=True)   # Per-factor scores
-    output_path = Column(String(1000), nullable=True)
+    output_path = Column(String(1000), nullable=True)     # ORIGINAL clip render (never overwritten by edits)
+    edited_output_path = Column(String(1000), nullable=True)  # Edits are saved as a SEPARATE copy here
     status = Column(Enum(ClipStatus), default=ClipStatus.PENDING, nullable=False, index=True)
     title = Column(String(200), nullable=True)
     description = Column(Text, nullable=True)
     hashtags = Column(Text, nullable=True)
     keywords = Column(Text, nullable=True)
+    hook_sentence = Column(Text, nullable=True)           # Best opening line to stop scrolling
+    virality_reason = Column(Text, nullable=True)         # Why this clip should go viral
     crop_data_json = Column(JSON, nullable=True)         # Face tracking crop coordinates
+    # ── Audio Remix (PHASE 1/3) ─────────────────────────────────────────
+    audio_mode = Column(String(20), nullable=True)       # keep_original | mute_music | replace_music
+    vocals_gain = Column(Float, default=1.0, nullable=True)
+    music_gain = Column(Float, default=1.0, nullable=True)
+    replacement_track = Column(String(1000), nullable=True)  # local royalty-free track path
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
@@ -211,6 +240,13 @@ class Clip(Base):
     subtitles = relationship("Subtitle", back_populates="clip", cascade="all, delete-orphan")
     thumbnails = relationship("Thumbnail", back_populates="clip", cascade="all, delete-orphan")
     uploads = relationship("Upload", back_populates="clip", cascade="all, delete-orphan")
+    voiceovers = relationship("VoiceOver", back_populates="clip", cascade="all, delete-orphan")
+    edits = relationship(
+        "ClipEdit",
+        back_populates="clip",
+        cascade="all, delete-orphan",
+        order_by="ClipEdit.id",
+    )
 
     def __repr__(self) -> str:
         return f"<Clip(id={self.id}, {self.start_time:.1f}s-{self.end_time:.1f}s, score={self.total_score})>"
@@ -230,6 +266,32 @@ class Subtitle(Base):
 
     def __repr__(self) -> str:
         return f"<Subtitle(id={self.id}, format={self.format})>"
+
+
+class ClipEdit(Base):
+    """A single labelled AI-edit of a clip (e.g. "Edit 1 - English").
+
+    Each edit is a SEPARATE file from the original (clips.output_path is the
+    pristine render and is NEVER overwritten). Multiple edits (one per subtitle
+    language) can coexist for the same clip, each with its own burned-in
+    subtitles, thumbnail and a user-facing label like "Edit 1 - English".
+    """
+
+    __tablename__ = "clip_edits"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    clip_id = Column(Integer, ForeignKey("clips.id", ondelete="CASCADE"), nullable=False, index=True)
+    label = Column(String(120), nullable=False, default="Edit")  # "Edit 1 - English", "Edit 2 - 中文"
+    language = Column(String(10), nullable=False, default="en")  # 'en' or 'zh'
+    output_path = Column(String(1000), nullable=False)           # relative: outputs\edited_clip_7_en.mp4
+    thumbnail_path = Column(String(1000), nullable=True)         # relative: thumbnails\edited_thumb_7_en.jpg
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+
+    # Relationships
+    clip = relationship("Clip", back_populates="edits")
+
+    def __repr__(self) -> str:
+        return f"<ClipEdit(id={self.id}, clip_id={self.clip_id}, label='{self.label}')>"
 
 
 class Thumbnail(Base):
@@ -273,6 +335,38 @@ class Upload(Base):
 
     def __repr__(self) -> str:
         return f"<Upload(id={self.id}, platform={self.platform}, status={self.status})>"
+
+
+class VoiceOver(Base):
+    """
+    A multilingual AI voice-over (dubbed) render of a clip.
+
+    Records the translation + synthesised speech + final muxed video produced
+    by :mod:`backend.services.voiceover`.
+    """
+
+    __tablename__ = "voiceovers"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    clip_id = Column(Integer, ForeignKey("clips.id", ondelete="CASCADE"), nullable=False, index=True)
+    language = Column(String(10), nullable=False)                # en | ko | hi | ja | zh
+    voice = Column(String(100), nullable=False)                  # edge-tts voice tag
+    mode = Column(String(20), nullable=False, default="replace")  # replace | mix
+    status = Column(Enum(VoiceOverStatus), default=VoiceOverStatus.PENDING, nullable=False, index=True)
+    source_text = Column(Text, nullable=True)              # Original clip transcript text
+    translated_text = Column(Text, nullable=True)           # Translated audio script
+    translated = Column(Integer, default=0)                 # 1 if translation succeeded
+    audio_path = Column(String(1000), nullable=True)         # Synthesised speech file
+    output_path = Column(String(1000), nullable=True)        # Final dubbed video
+    error_message = Column(Text, nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    # Relationships
+    clip = relationship("Clip", back_populates="voiceovers")
+
+    def __repr__(self) -> str:
+        return f"<VoiceOver(id={self.id}, clip={self.clip_id}, lang='{self.language}')>"
 
 
 class Setting(Base):

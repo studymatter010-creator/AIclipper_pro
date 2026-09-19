@@ -31,7 +31,8 @@ def main() -> None:
         backoff=1.15,
         max_delay=10.0,
         scheduler_interval=1,
-        verbose=True,
+        # NOTE: 'verbose' was removed in Huey 2.5+ — drop it (verbosity is set
+        # via loglevel/logging config on newer versions).
     )
 
     print("=" * 50)

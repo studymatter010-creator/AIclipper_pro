@@ -183,13 +183,14 @@ async def _do_upload(clip_id: int, platform: str) -> dict:
 # ===========================================================================
 
 @huey.task()
-def regenerate_metadata_task(clip_id: int, model: str = "qwen2") -> dict:
-    """Regenerate AI metadata (title, description, hashtags) for a clip."""
+def regenerate_metadata_task(clip_id: int, model: str | None = None) -> dict:
+    """Regenerate AI metadata (title, description, hashtags) for a clip.
+    Default model = settings.ollama_model (qwen3:8b)."""
     logger.info(f"Regenerating metadata for clip {clip_id}")
     return _run_async(_do_regenerate_metadata(clip_id, model))
 
 
-async def _do_regenerate_metadata(clip_id: int, model: str) -> dict:
+async def _do_regenerate_metadata(clip_id: int, model: str | None) -> dict:
     from backend.database import crud
     from backend.database.engine import get_session_context
     from backend.services.metadata_generator import generate_metadata

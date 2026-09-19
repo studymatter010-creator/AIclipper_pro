@@ -6,6 +6,8 @@ Endpoints for uploading, listing, and retrieving video details.
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import shutil
 import uuid
 from pathlib import Path
@@ -18,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.api.deps import get_config, get_current_user, get_db
 from backend.api.schemas import (
     ErrorResponse,
+    ImportUrlRequest,
     VideoDetail,
     VideoListItem,
     VideoListResponse,
@@ -32,6 +35,43 @@ from backend.utils.validators import ValidationError, validate_video_file
 logger = get_logger("api.videos")
 
 router = APIRouter(tags=["Videos"])
+
+
+def _sha256_of_file(path: Path) -> str:
+    """Compute the SHA-256 of a file's bytes (runs once per upload/import)."""
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        while chunk := fh.read(1024 * 1024):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+async def _existing_for_source(
+    db: AsyncSession,
+    *,
+    content_hash: str | None = None,
+    source_video_id: str | None = None,
+):
+    """Return a usable existing video row for dedup, or None.
+
+    A match only counts if its stored source file still exists on disk —
+    otherwise (e.g. the file was manually deleted) treat it as a fresh import
+    rather than pointing at a path that no longer resolves.
+    """
+    candidates = []
+    if content_hash:
+        candidates.extend(await crud.get_videos_by_hash(db, content_hash))
+    if source_video_id:
+        hit = await crud.get_video_by_source_id(db, source_video_id)
+        if hit:
+            candidates.append(hit)
+    for v in candidates:
+        try:
+            if v.filepath and Path(v.filepath).exists():
+                return v
+        except OSError:
+            continue
+    return None
 
 
 @router.post(
@@ -68,7 +108,7 @@ async def upload_video(
 
     logger.info(f"Receiving upload: {original_name} -> {safe_name}")
 
-    # Stream file to disk
+    # ── 1. Stream the bytes to disk ───────────────────────────────────────
     try:
         async with aiofiles.open(save_path, "wb") as out_file:
             while chunk := await file.read(1024 * 1024):  # 1 MB chunks
@@ -80,7 +120,7 @@ async def upload_video(
             detail="Failed to save uploaded file.",
         )
 
-    # Validate the saved file
+    # ── 2. Validate + hash the saved file ─────────────────────────────────
     try:
         metadata = validate_video_file(save_path, original_name)
     except ValidationError as exc:
@@ -89,6 +129,22 @@ async def upload_video(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=exc.message,
+        )
+    content_hash = _sha256_of_file(save_path)
+
+    # ── 3. Dedup: same bytes already uploaded? ────────────────────────────
+    # If an existing Video row stores the same content (and its file still
+    # exists on disk), do NOT keep a second copy — drop the one we just wrote
+    # and point the caller at the existing record instead.
+    existing = await _existing_for_source(db, content_hash=content_hash)
+    if existing is not None:
+        save_path.unlink(missing_ok=True)  # don't store the duplicate
+        logger.info(
+            f"Upload duplicate detected (hash {content_hash[:12]}...) — "
+            f"reusing existing video id={existing.id}, no second file saved"
+        )
+        return VideoUploadResponse.model_validate(
+            existing, update={"deduped": True}
         )
 
     # Ensure a default project exists for the user if project_id not provided
@@ -100,12 +156,13 @@ async def upload_video(
             project = await crud.create_project(db, user_id=user.id, name="Default Project")
             project_id = project.id
 
-    # Create the video record
+    # Create the video record with its content hash for future dedup checks
     video = await crud.create_video(
         db,
         project_id=project_id,
         filename=original_name,
         filepath=str(save_path),
+        content_hash=content_hash,
         **metadata,
     )
 
@@ -161,3 +218,125 @@ async def get_video_detail(
             detail=f"Video with id {video_id} not found.",
         )
     return VideoDetail.model_validate(video)
+
+
+@router.post(
+    "/api/import-url",
+    response_model=VideoUploadResponse,
+    status_code=status.HTTP_201_CREATED,
+    responses={
+        400: {"model": ErrorResponse, "description": "Invalid URL or download failed"},
+        500: {"model": ErrorResponse, "description": "Internal server error"},
+    },
+    summary="Import video from a URL",
+    description="Download a video from a shareable YouTube/Facebook URL and create "
+    "a video record, optionally starting AI processing automatically.",
+)
+async def import_video_from_url(
+    body: ImportUrlRequest,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+    config: Settings = Depends(get_config),
+) -> VideoUploadResponse:
+    """Download a video from ``body.url`` and register it as a video."""
+    from backend.services.downloader import (
+        DownloadError,
+        detect_platform,
+        download_video,
+        extract_source_id,
+    )
+
+    if not body.url.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="URL is required.",
+        )
+
+    platform = detect_platform(body.url)
+    if platform == "other":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only YouTube and Facebook video URLs are supported.",
+        )
+
+    # ── 1. Dedup: same source already imported? ───────────────────────────
+    # Resolve the platform source-ID from the URL BEFORE any download and reuse
+    # the existing stored file if we've already pulled this source.  This saves
+    # bandwidth AND avoids a duplicate copy on disk.  Only counts if the stored
+    # file still exists (otherwise it's a fresh import / re-download).
+    source_video_id = extract_source_id(body.url)
+    existing = None
+    if source_video_id:
+        existing = await _existing_for_source(db, source_video_id=source_video_id)
+    if existing is not None:
+        logger.info(
+            f"URL import duplicate detected (source_id={source_video_id}) — "
+            f"reusing existing video id={existing.id}, no re-download"
+        )
+        return VideoUploadResponse.model_validate(
+            existing, update={"deduped": True}
+        )
+
+    # ── 2. Download via yt-dlp ───────────────────────────────────────────
+    try:
+        result = await asyncio.to_thread(download_video, body.url.strip())
+    except DownloadError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        )
+
+    save_path = Path(result["file_path"])
+
+    # ── 2. Validate the downloaded file ──────────────────────────────────
+    try:
+        metadata = validate_video_file(save_path, result["filename"])
+    except ValidationError as exc:
+        save_path.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=exc.message,
+        )
+
+    # ── 3. Ensure a project exists ───────────────────────────────────────
+    project_id = body.project_id
+    if project_id is None:
+        projects = await crud.list_projects(db, user_id=user.id, limit=1)
+        if projects:
+            project_id = projects[0].id
+        else:
+            project = await crud.create_project(db, user_id=user.id, name="Default Project")
+            project_id = project.id
+
+    # ── 4. Create the video record ───────────────────────────────────────
+    display_name = result.get("title") or result["filename"]
+    video = await crud.create_video(
+        db,
+        project_id=project_id,
+        filename=display_name,
+        filepath=str(save_path),
+        source_url=body.url.strip(),
+        source_video_id=(result.get("source_video_id") or source_video_id),
+        content_hash=_sha256_of_file(save_path),
+        **metadata,
+    )
+
+    logger.info(
+        f"Video imported from URL: id={video.id}, platform={platform}, "
+        f"title='{display_name[:60]}'",
+        extra={"video_id": video.id},
+    )
+
+    # ── 5. Auto-start processing if requested ────────────────────────────
+    if body.auto_process and video.status.value not in ("processing", "completed"):
+        from backend.api.routes.processing import start_processing
+
+        try:
+            await start_processing(
+                video_id=video.id, db=db,
+                clip_count=body.clip_count, clip_duration=body.clip_duration,
+            )
+        except Exception as exc:  # noqa: BLE001 — processing is best-effort
+            logger.warning(f"Auto-processing for imported video failed: {exc}")
+
+    return VideoUploadResponse.model_validate(video)

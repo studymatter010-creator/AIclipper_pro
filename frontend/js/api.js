@@ -121,12 +121,24 @@ class APIClient {
     // Processing
     // ─────────────────────────────────────────────
 
-    async startProcessing(videoId) {
-        return this.post(`/process/${videoId}`);
+    async startProcessing(videoId, options = {}) {
+        const payload = {};
+        if (options.clip_count) payload.clip_count = options.clip_count;
+        if (options.clip_duration) payload.clip_duration = options.clip_duration;
+        // Only send a body if we actually have options to send.
+        return this.post(`/process/${videoId}`, Object.keys(payload).length ? payload : null);
     }
 
     async getStatus(videoId) {
         return this.get(`/status/${videoId}`);
+    }
+
+    async importFromUrl(url, opts = {}) {
+        const payload = { url, auto_process: opts.auto_process !== false };
+        if (opts.project_id) payload.project_id = opts.project_id;
+        if (opts.clip_count) payload.clip_count = opts.clip_count;
+        if (opts.clip_duration) payload.clip_duration = opts.clip_duration;
+        return this.post('/import-url', payload);
     }
 
     // ─────────────────────────────────────────────
@@ -147,8 +159,95 @@ class APIClient {
         return this.del(`/clips/${clipId}`);
     }
 
+    async bulkDeleteClips(clipIds) {
+        return this.post('/clips/bulk-delete', { clip_ids: clipIds });
+    }
+
     getClipDownloadUrl(clipId) {
         return `${API_BASE}/clips/${clipId}/download`;
+    }
+
+    getClipThumbnailUrl(clipId) {
+        return `${API_BASE}/clips/${clipId}/thumbnail`;
+    }
+
+    // ─────────────────────────────────────────────
+    // AI Editor / Voice-Over
+    // ─────────────────────────────────────────────
+
+    getVoices() {
+        return this.get('/voices');
+    }
+
+    autoEditClip(clipId, options = {}) {
+        return this.post(`/clips/${clipId}/auto-edit`, options);
+    }
+
+    // Part B: 4-6 scored candidate frames for the thumbnail editor filmstrip.
+    thumbnailCandidates(clipId) {
+        return this.get(`/clips/${clipId}/thumbnail-candidates`);
+    }
+
+    // Upload YOUR OWN music track to swap into a clip (Audio Remix).
+    async uploadClipMusic(clipId, file) {
+        const formData = new FormData();
+        formData.append('file', file);
+        return new Promise((resolve, reject) => {
+            const xhr = new XMLHttpRequest();
+            xhr.open('POST', `${API_BASE}/clips/${clipId}/music`);
+            xhr.onload = () => {
+                if (xhr.status >= 200 && xhr.status < 300) {
+                    resolve(JSON.parse(xhr.responseText));
+                } else {
+                    try {
+                        const err = JSON.parse(xhr.responseText);
+                        reject(new Error(err.detail || `Upload failed: ${xhr.status}`));
+                    } catch { reject(new Error(`Upload failed: ${xhr.status}`)); }
+                }
+            };
+            xhr.onerror = () => reject(new Error('Upload network error'));
+            xhr.send(formData);
+        });
+    }
+
+    teamStatus() {
+        return this.get('/team/status');
+    }
+
+    // ─────────────────────────────────────────────
+    // AI Providers (BYOK)
+    // ─────────────────────────────────────────────
+
+    getProviders() {
+        return this.get('/providers');
+    }
+
+    setRoleProvider(role, provider, model = null) {
+        return this.put('/providers/role', { role, provider, model });
+    }
+
+    testProvider(provider, model = null) {
+        return this.post('/providers/test', { provider, model });
+    }
+
+    storeProviderKey(provider, key) {
+        return this.put('/providers/key', { provider, key });
+    }
+
+    deleteProviderKey(provider) {
+        return this.del(`/providers/key/${provider}`);
+    }
+
+    getProviderUsage() {
+        return this.get('/providers/usage');
+    }
+
+    dubClip(clipId, payload) {
+        return this.post(`/clips/${clipId}/dub`, payload);
+    }
+
+    getClipVoiceovers(clipId) {
+        return this.get(`/clips/${clipId}/voiceovers`);
     }
 
     // ─────────────────────────────────────────────
@@ -191,6 +290,38 @@ class APIClient {
 
     async updateSettings(settings) {
         return this.put('/settings', { settings });
+    }
+
+    // ─────────────────────────────────────────────
+    // Storage & Deletion
+    // ─────────────────────────────────────────────
+
+    async getStorageUsage() {
+        return this.get('/storage/usage');
+    }
+
+    async deleteVideo(videoId, mode, confirm = false) {
+        return this.post(`/videos/${videoId}/delete`, { mode, confirm });
+    }
+
+    async listOrphans() {
+        return this.get('/storage/orphans');
+    }
+
+    async cleanupOrphans(confirm = false) {
+        return this.post('/storage/orphans/cleanup', { confirm });
+    }
+
+    async cleanupPendingVideos(confirm = false) {
+        return this.post('/storage/videos/pending-cleanup', { confirm });
+    }
+
+    async clearTemp(confirm = false) {
+        return this.post('/storage/temp-cleanup', { confirm });
+    }
+
+    async countPendingVideos() {
+        return this.get('/storage/video-count-pending');
     }
 
     // ─────────────────────────────────────────────

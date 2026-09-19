@@ -38,6 +38,8 @@ dependencies = [
     "mediapipe>=0.10.14",
     "librosa>=0.10",
     "ollama>=0.3",
+    "edge-tts>=6.1",  # Multilingual neural voice-overs (EN/KO/HI/JA)
+    "yt-dlp>=2024.10.0",  # Download videos from YouTube/Facebook by URL
 
     # Upload APIs
     "google-api-python-client>=2.140",

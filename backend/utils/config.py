@@ -145,22 +145,100 @@ class Settings(BaseSettings):
         default_factory=lambda: f"sqlite+aiosqlite:///{PROJECT_ROOT / 'data' / 'aiclipper.db'}"
     )
 
-    # --- Whisper ---
-    whisper_model: str = "small.en"
+    # --- Whisper (PHASE 1: faster-whisper is the PRIMARY ASR engine) ---
+    # faster-whisper (CTranslate2) name.  Phase 1 directive: distil-large-v3 OR
+    # large-v3-turbo (both distilled/turbo variants, more RAM-frugal than full
+    # large-v3).  The generalized RAM sequencer (model_team) evicts other heavy
+    # models so these fit on 16GB alongside qwen3:8b.  Keep "small" as the safe
+    # fallback if OOM persists.  CTranslate2 CANNOT load ggml-*.bin weights.
+    whisper_model: str = "distil-large-v3"
+    # whisper.cpp fallback weights (pywhispercpp engine only; smaller to fit RAM).
     whisper_model_path: Path = Field(
-        default_factory=lambda: PROJECT_ROOT / "models" / "ggml-small.en.bin"
+        default_factory=lambda: PROJECT_ROOT / "models" / "ggml-small.bin"
     )
     whisper_threads: int = 4
     whisper_language: str = "auto"
 
-    # --- Ollama ---
+    # --- WhisperX forced alignment (PHASE 1: source-of-truth word timestamps) ---
+    # WhisperX refines faster-whisper's word timestamps via a wav2vec2 phoneme
+    # aligner, fixing word-audio desync and improving word-level karaoke
+    # highlighting — and becomes the sentence-boundary source for Phase 2/4.
+    # wav2vec2 base aligner adds ~0.4-1.5GB RAM; the generalized sequencer
+    # evicts competing heavy models so it fits. On ANY failure the pipeline
+    # safely falls back to faster-whisper's native word timestamps.
+    whisperx_align: bool = True
+    whisperx_align_model: str = "facebook/wav2vec2-base-960h"
+    whisperx_language: str = "en"
+
+    # --- Ollama (the "AI brain") ---
+    # qwen3:8b — best fit for 16GB RAM alongside Whisper. Native Chinese,
+    # strong instruction-following + structured output for metadata generation.
     ollama_host: str = "http://localhost:11434"
-    ollama_model: str = "qwen2.5:1.5b"
+    ollama_model: str = "qwen3:8b"
     ollama_timeout: int = 120
+
+    # --- Model Team (specialized experts cooperating in sequence) ---
+    # Each complex task is delegated to a purpose-picked model, coordinated by
+    # backend/services/model_team.py. The heavy brain (ollama_model) is NOT kept
+    # resident while a light specialist does fast work — the sequencer unloads
+    # LRU models to stay under team_ram_budget_mb so 16GB never OOMs.
+    # Specialists share the small qwen2.5:3b (fast, strong zh + JSON output).
+    team_classify: str = "qwen2.5:3b"     # content-type / density classifier
+    team_hook: str = "qwen2.5:3b"         # snap-hook opening-line extractor
+    team_translate: str = "qwen2.5:3b"    # Ollama subtitle-translate FALLBACK (NLLB-200 is now primary)
+    team_ram_budget_mb: int = 9000        # keep all resident Ollama models ≤ this
+
+    # --- BYOK (bring-your-own-key): pluggable API providers per role ---
+    # Per-role provider routing is persisted in the user settings table and
+    # cached by backend/services/llm/role_config.py; these are the *defaults*
+    # used before any role is configured (every role defaults to Local/Ollama,
+    # so the app works with zero API keys). ``team_ollama_default`` seeds the
+    # local model each role would otherwise use.
+    team_ollama_default: str = "qwen3:8b"           # default brain via local
+    llm_openai_compatible_base: str = ""             # base URL for an OpenAI-compatible endpoint (non-empty enables it)
+    llm_anthropic_max_tokens: int = 1024
+
+    # --- NLLB-200 translation (PHASE 1: replaces Ollama translate) ---
+    # Purpose-built many-to-many translator via CTranslate2 (CPU).  Deterministic
+    # subtitle translation with native Simplified-Chinese output.  Computes on CPU
+    # int8 to fit the 16GB budget alongside qwen3:8b, Demucs and WhisperX.
+    nllb_model: str = "facebook/nllb-200-distilled-600M"
+    nllb_sentencepiece_model: str = ""        # optional override path to the .spm file
+    nllb_device: str = "cpu"                  # "cpu" | "cuda"
+    nllb_compute: str = "int8"                # "int8" | "fp16" | "float32" (int8 = smallest on CPU)
+    nllb_beam: int = 1                        # 1 = greedy (deterministic subtitles); raise for quality
+    nllb_repetition_penalty: float = 1.3
+    nllb_max_length: int = 256
+    nllb_max_batch: int = 16
+
+    # --- Demucs (PHASE 1: Audio Remix stems) ---
+    demucs_model: str = "htdemucs"            # 4-stem: vocals/drums/bass/other
+    demucs_device: str = "cpu"
+    demucs_shifts: int = 1
+    demucs_sample_rate: int = 44100           # fallback stem sample rate if unprovided
+
+    # --- bge-small-en (PHASE 1: semantic clip boundaries, Phase 2) ---
+    # ~134MB embedding model for sentence similarity used to anchor clip
+    # candidates at sentence boundaries in Phase 2.
+    bge_model: str = "BAAI/bge-small-en-v1.5"
+
+    # --- Semantic boundaries (PHASE 2) ---
+    # Topic-shift cosine threshold for sentence-to-sentence embedding
+    # similarity; a seam below this value is treated as a semantic boundary.
+    semantic_threshold: float = 0.65
+    # Enables semantic-anchored clip candidate windows in addition to the
+    # plain sliding sweep (score_clips).
+    semantic_boundaries_enabled: bool = True
 
     # --- MediaPipe ---
     mediapipe_model_path: Path = Field(
         default_factory=lambda: PROJECT_ROOT / "models" / "blaze_face_short_range.tflite"
+    )
+    # FaceLandmarker model for facial-expressiveness scoring (Change 5): mouth-open
+    # distance + eyebrow-raise drive thumbnail frame selection.  Optional — when
+    # this file is absent, expressiveness scoring returns a neutral 0.5.
+    mediapipe_landmark_model_path: Path = Field(
+        default_factory=lambda: PROJECT_ROOT / "models" / "face_landmarker.task"
     )
     face_sample_every_n_frames: int = 3
 
@@ -169,9 +247,11 @@ class Settings(BaseSettings):
     ffprobe_path: str = "ffprobe"
 
     # --- Clip Settings ---
-    clip_durations: str = "15,30,60"
+    # Premium short-form length: 1–1.5 minute clips by default.
+    clip_durations: str = "60,75,90"
     max_clips_per_video: int = 10
     min_clip_gap_seconds: int = 10
+    face_crop_enabled: bool = False  # Smart vertical face-crop. OFF by default: clips preserve the WHOLE source frame with blurred bars over a 1080x1920 canvas.
 
     # --- Scoring Weights ---
     scoring_weights: ScoringWeights = ScoringWeights()
@@ -237,13 +317,13 @@ class Settings(BaseSettings):
         flat: dict[str, Any] = {}
         if "whisper" in yaml_data:
             w = yaml_data["whisper"]
-            flat["whisper_model"] = w.get("model", "small.en")
+            flat["whisper_model"] = w.get("model", "small")
             flat["whisper_threads"] = w.get("threads", 4)
             flat["whisper_language"] = w.get("language", "auto")
         if "ollama" in yaml_data:
             o = yaml_data["ollama"]
             flat["ollama_host"] = o.get("host", "http://localhost:11434")
-            flat["ollama_model"] = o.get("model", "qwen2.5:1.5b")
+            flat["ollama_model"] = o.get("model", "qwen3:8b")
             flat["ollama_timeout"] = o.get("timeout", 120)
         if "clips" in yaml_data:
             c = yaml_data["clips"]

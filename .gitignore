@@ -7,11 +7,13 @@ __pycache__/
 dist/
 build/
 *.egg
+*.pyc
 
 # Virtual environments
 .venv/
 venv/
 ENV/
+env/
 
 # IDE
 .vscode/
@@ -19,9 +21,13 @@ ENV/
 *.swp
 *.swo
 *~
+.DS_Store
 
-# Environment
+# Environment & Secrets
 .env
+.env.local
+*.key
+*.pem
 
 # Runtime data (generated at runtime)
 uploads/
@@ -31,20 +37,39 @@ thumbnails/
 logs/
 temp/
 data/
+models/downloads/
 
-# AI Models (downloaded separately)
+# AI Models (downloaded at runtime)
 models/*.bin
 models/*.tflite
+models/*.pt
+models/*.onnx
 
 # Database
 *.db
 *.db-journal
 *.db-wal
+*.sqlite
+*.sqlite3
 
 # OS
 .DS_Store
 Thumbs.db
 desktop.ini
+*.tmp
 
 # Docker
 docker/volumes/
+
+# Node modules (if any)
+node_modules/
+
+# Test coverage
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Distribution / Packaging
+*.zip
+*.tar.gz
+release/

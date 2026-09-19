@@ -14,7 +14,7 @@ from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisco
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.api.deps import get_db
-from backend.api.schemas import ErrorResponse, ProcessingStatusResponse
+from backend.api.schemas import ErrorResponse, ProcessOptions, ProcessingStatusResponse
 from backend.database import crud
 from backend.database.models import VideoStatus
 from backend.utils.logging import get_logger
@@ -38,7 +38,10 @@ router = APIRouter(tags=["Processing"])
 )
 async def start_processing(
     video_id: int,
+    body: ProcessOptions | None = None,
     db: AsyncSession = Depends(get_db),
+    clip_count: int | None = None,
+    clip_duration: int | None = None,
 ) -> ProcessingStatusResponse:
     """Start the AI processing pipeline for a video."""
     video = await crud.get_video(db, video_id)
@@ -54,6 +57,11 @@ async def start_processing(
             detail="Video is already being processed.",
         )
 
+    # Resolve clip tuning options (query params override body values).
+    if body is not None:
+        clip_count = clip_count or body.clip_count
+        clip_duration = clip_duration or body.clip_duration
+
     await crud.update_video_status(
         db,
         video_id=video_id,
@@ -62,10 +70,14 @@ async def start_processing(
         step="queued",
     )
 
-    logger.info(f"Processing started for video {video_id}", extra={"video_id": video_id})
+    logger.info(
+        f"Processing started for video {video_id} "
+        f"(clip_count={clip_count}, clip_duration={clip_duration})",
+        extra={"video_id": video_id},
+    )
 
     # Launch the pipeline as a background task
-    asyncio.create_task(_run_pipeline_background(video_id))
+    asyncio.create_task(_run_pipeline_background(video_id, clip_count, clip_duration))
 
     return ProcessingStatusResponse(
         video_id=video_id,
@@ -75,11 +87,19 @@ async def start_processing(
     )
 
 
-async def _run_pipeline_background(video_id: int) -> None:
+async def _run_pipeline_background(
+    video_id: int,
+    clip_count: int | None = None,
+    clip_duration: int | None = None,
+) -> None:
     """Run the pipeline in the background, catching all exceptions."""
     try:
         from backend.services.pipeline import process_video_pipeline
-        result = await process_video_pipeline(video_id)
+        result = await process_video_pipeline(
+            video_id,
+            clip_count=clip_count,
+            clip_duration=clip_duration,
+        )
         logger.info(f"Background pipeline completed for video {video_id}: {result.get('clips_generated', 0)} clips")
     except Exception as e:
         logger.error(f"Background pipeline failed for video {video_id}: {e}", exc_info=True)
@@ -109,6 +129,8 @@ async def get_processing_status(
         status=video.status.value if isinstance(video.status, VideoStatus) else str(video.status),
         progress=video.processing_progress or 0,
         step=video.processing_step,
+        stage=video.current_stage,
+        stage_progress=video.stage_progress,
         error_message=video.error_message,
     )
 
@@ -151,6 +173,8 @@ async def ws_progress(
                 "status": current_status,
                 "progress": video.processing_progress or 0,
                 "step": video.processing_step,
+                "stage": video.current_stage,
+                "stage_progress": video.stage_progress,
                 "error_message": video.error_message,
             }
 

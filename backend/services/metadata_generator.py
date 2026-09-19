@@ -231,7 +231,7 @@ def _call_deepseek(prompt: str, model: str) -> str | None:
 # ── Provider registry ───────────────────────────────────────────────────
 
 _PROVIDERS: dict[str, dict[str, Any]] = {
-    "ollama": {"call": _call_ollama, "default_model": "qwen2.5:1.5b"},
+    "ollama": {"call": _call_ollama, "default_model": "qwen3:8b"},
     "openai": {"call": _call_openai, "default_model": "gpt-4o-mini"},
     "gemini": {"call": _call_gemini, "default_model": "gemini-1.5-flash"},
     "deepseek": {"call": _call_deepseek, "default_model": "deepseek-chat"},

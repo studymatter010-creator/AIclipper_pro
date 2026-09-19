@@ -8,6 +8,8 @@ for maximum cross-platform reliability.
 
 from __future__ import annotations
 
+import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -250,17 +252,40 @@ def convert_shorts_format(
     output_path: Path,
 ) -> Path:
     """
-    Convert a clip to YouTube Shorts 1080x1920 format with a blurred background.
+    Convert a clip to the configured vertical canvas (default 1080x1920, 9:16)
+    using a "fit with blurred background" layout.
+
+    The ENTIRE source frame is always kept visible (never cropped):
+      * background = the source scaled up to fill the canvas, then blurred
+      * foreground = the source scaled DOWN to fit within the canvas (whole frame)
+      * overlay centers the foreground; any leftover bars are filled by the blur
+
+    Handles every source aspect ratio gracefully:
+      * 16:9 / landscape  -> letterboxed top & bottom with blurred fill
+      * 9:16 / portrait   -> fills the canvas exactly (no bars)
+      * square / other    -> blurred fill in both axes
     """
     from backend.utils.validators import probe_video
     settings = get_settings()
 
-    probe_data = probe_video(input_path)
+    # Probe validates the input decodes before we build the filter graph.
+    probe_video(input_path)
 
+    w = settings.output_settings.width
+    h = settings.output_settings.height
+
+    # The background is the source scaled up to fill the canvas; on landscape
+    # sources the upscale factor is large, so a mild boxblur still leaves a
+    # RECOGNIZABLE (duplicate) face in the bars — the "blurred backdrop reads as
+    # a face" bug.  Fix: blur in two strong passes (the second uses a bigger
+    # window to smear large features), then desaturate + darken so it recedes
+    # behind the sharp foreground instead of competing with it.
     vf = (
-        "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=25:5[bg];"
-        "[0:v]scale=1080:1920:force_original_aspect_ratio=decrease[fg];"
-        "[bg][fg]overlay=(W-w)/2:(H-h)/2"
+        f"[0:v]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},"
+        f"boxblur=lr=55:lp=2,boxblur=lr=35:lp=2,"
+        f"eq=saturation=0.35:brightness=-0.18[bg];"
+        f"[0:v]scale={w}:{h}:force_original_aspect_ratio=decrease[fg];"
+        f"[bg][fg]overlay=(W-w)/2:(H-h)/2"
     )
 
     args = [
@@ -275,7 +300,7 @@ def convert_shorts_format(
         "-y", str(output_path),
     ]
 
-    _run_ffmpeg(args, f"Shorts format conversion of {input_path.name}")
+    _run_ffmpeg(args, f"Vertical fit+blur conversion of {input_path.name}")
     return output_path
 
 
@@ -439,6 +464,76 @@ def extract_frames_batch(
     return frames
 
 
+def probe_achieved_start(
+    video_path: Path,
+    requested_start: float,
+    lookback_seconds: float = 60.0,
+) -> float:
+    """Return the ACTUAL start time (source seconds) a stream-copy cut at
+    ``requested_start`` will land on.
+
+    ``cut_clip(..., reencode=False)`` uses ``-ss <t>`` *input* seeking with
+    ``-c copy``.  FFmpeg satisfies that seek by starting at the LAST KEYFRAME at
+    or before ``t``, so the rendered clip begins a little EARLIER than requested
+    (the "timing lead" that used to push captions early).  This helper probes the
+    source's keyframe timestamps in the window just before ``requested_start``
+    and returns the snap point, so callers can rebase subtitles against the
+    clip's REAL first frame instead of the requested (wrong) value.
+
+    Falls back to ``requested_start`` if probing fails or finds no keyframe.
+    """
+    settings = get_settings()
+    lo = max(0.0, requested_start - lookback_seconds)
+    interval = f"{lo:.3f}%{requested_start:.3f}"
+    cmd = [
+        settings.ffprobe_path, "-v", "error",
+        "-select_streams", "v:0",
+        "-skip_frame", "nokey",
+        "-show_entries", "frame=best_effort_timestamp_time,pts_time",
+        "-read_intervals", interval,
+        "-of", "json",
+        str(video_path),
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            creationflags=_get_creation_flags(),
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return requested_start
+        import json as _json
+        data = _json.loads(result.stdout)
+        times: list[float] = []
+        for frame in data.get("frames") or []:
+            ts = frame.get("best_effort_timestamp_time")
+            if ts is None:
+                ts = frame.get("pts_time")
+            if ts is None:
+                continue
+            try:
+                t = float(ts)
+            except (TypeError, ValueError):
+                continue
+            if t <= requested_start + 0.01:
+                times.append(t)
+        if times:
+            achieved = max(times)
+            logger.debug(
+                f"probe_achieved_start: req={requested_start:.3f} -> {achieved:.3f} "
+                f"(snapped to prior keyframe)"
+            )
+            return round(achieved, 3)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            f"Could not probe achieved start for {video_path.name}; "
+            f"using requested {requested_start:.3f}"
+        )
+    return requested_start
+
+
 def get_video_duration(video_path: Path) -> float:
     """Quick duration probe using FFprobe."""
     settings = get_settings()
@@ -460,3 +555,178 @@ def get_video_duration(video_path: Path) -> float:
         return float(result.stdout.strip())
     except (ValueError, subprocess.TimeoutExpired, FileNotFoundError):
         return 0.0
+
+
+def _probe_streams(path: Path) -> dict[str, dict[str, Any]]:
+    """Best-effort ffprobe of the video/audio stream properties for a file."""
+    settings = get_settings()
+    try:
+        result = subprocess.run(
+            [
+                settings.ffprobe_path,
+                "-v", "quiet",
+                "-print_format", "json",
+                "-show_streams",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            creationflags=_get_creation_flags(),
+        )
+        data = json.loads(result.stdout)
+    except (json.JSONDecodeError, subprocess.TimeoutExpired, FileNotFoundError):
+        return {}
+    streams = data.get("streams", [])
+    return {
+        "video": next((s for s in streams if s.get("codec_type") == "video"), None) or {},
+        "audio": next((s for s in streams if s.get("codec_type") == "audio"), None) or {},
+    }
+
+
+@timed(logger_name="processing")
+def add_thumbnail_intro(
+    video_path: Path,
+    thumbnail_path: Path,
+    duration: float = 0.8,
+) -> Path:
+    """
+    Prepend a motionless thumbnail frame as an intro to a clip.
+
+    Returns a path the caller should keep using (normally ``video_path`` itself),
+    transparently pointing at the clip-with-intro. The caller's DB file path
+    (e.g. ``clips.output_path`` / the ClipEdit file) does NOT need to change.
+
+    The input clip is never the persistent source of truth we overwrite blindly —
+    we build the intro-prefixed clip in a temp file and atomically replace the
+    given path so downstream references stay valid. If anything can't be done
+    (missing inputs, FFmpeg error, non-atomic replace), we log and return the
+    ORIGINAL ``video_path`` unchanged, so callers can safely use the return value
+    without an error branch.
+
+    How it works (matching the clip exactly so a concat stays glitch-free):
+      1) Render a looped still of ``thumbnail_path`` at the clip's resolution +
+         fps, scaled to fill the frame.
+      2) Add a silent audio track matching the clip's sample rate + channel layout
+         (avoids "audio pop" and makes the streams compatible).
+      3) Concatenate [intro, main] via the concat demuxer with CONSISTENT
+         re-encode settings (libx264 / AAC) so streams are guaranteed compatible.
+
+    ``duration`` is clamped to [0.1, 10.0] seconds (default 0.8).
+    """
+    video_path = Path(video_path)
+    thumbnail_path = Path(thumbnail_path)
+
+    if not video_path.exists():
+        logger.warning(f"[INTRO] Skip: clip missing ({video_path})")
+        return video_path
+    if not thumbnail_path.exists():
+        logger.warning(f"[INTRO] Skip: thumbnail missing ({thumbnail_path})")
+        return video_path
+
+    duration = max(0.1, min(float(duration), 10.0))
+    settings = get_settings()
+    oc = settings.output_settings
+
+    # 1) Probe the clip for the video/audio properties we must mirror.
+    probe = _probe_streams(video_path)
+    v = probe.get("video") or {}
+    a = probe.get("audio") or {}
+    width = int(v.get("width") or 0) or oc.width
+    height = int(v.get("height") or 0) or oc.height
+
+    fps = 0.0
+    r_frame_rate = v.get("r_frame_rate", "0/1")
+    if "/" in r_frame_rate:
+        num, den = r_frame_rate.split("/")
+        fps = float(num) / float(den) if float(den) > 0 else 0.0
+    if fps <= 0:
+        fps = float(oc.fps or 30)
+
+    sample_rate = a.get("sample_rate") or "44100"
+    channel_layout = a.get("channel_layout") or "stereo"
+
+    parent = video_path.parent
+    stem = video_path.stem
+    intro_file = parent / f"{stem}._intro.mp4"
+    concat_list = parent / f"{stem}._intro_list.txt"
+    tmp_final = parent / f"{stem}._introtmp.mp4"
+
+    try:
+        # 2) Build the intro segment: looped thumbnail + matching silent audio.
+        intro_args = [
+            "-loop", "1",
+            "-framerate", f"{fps:g}",
+            "-i", str(thumbnail_path.resolve()),
+            "-f", "lavfi",
+            "-i", f"anullsrc=r={sample_rate}:cl={channel_layout}",
+            "-vf",
+            (f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+             f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"),
+            "-c:v", oc.codec,
+            "-pix_fmt", "yuv420p",
+            "-r", f"{fps:g}",
+            "-crf", str(oc.crf),
+            "-preset", oc.preset,
+            "-c:a", oc.audio_codec,
+            "-b:a", str(oc.audio_bitrate),
+            "-t", f"{duration:.3f}",
+            "-shortest",
+            "-y", str(intro_file),
+        ]
+        _run_ffmpeg(intro_args, f"Thumbnail intro segment for {video_path.name}")
+        if not intro_file.exists():
+            raise RuntimeError("intro segment was not produced")
+
+        # 3) Concatenate [intro, main] with consistent re-encode settings so the
+        #    streams are guaranteed compatible (concat demuxer + transcode).
+        # Must use POSIX separators in the list file: on Windows the concat
+        # demuxer mangles "C:\..." (backslash escaping), so write forward slashes
+        # (mirrors concat_videos in auto_editor.py).
+        concat_list.write_text(
+            f"file '{intro_file.resolve().as_posix()}'\nfile '{video_path.resolve().as_posix()}'\n",
+            encoding="utf-8",
+        )
+        concat_args = [
+            "-f", "concat", "-safe", "0",
+            "-i", str(concat_list),
+            "-c:v", oc.codec,
+            "-pix_fmt", "yuv420p",
+            "-crf", str(oc.crf),
+            "-preset", oc.preset,
+            "-c:a", oc.audio_codec,
+            "-b:a", str(oc.audio_bitrate),
+            "-movflags", "+faststart",
+            "-y", str(tmp_final),
+        ]
+        _run_ffmpeg(concat_args, f"Intro concat for {video_path.name}")
+
+        if not tmp_final.exists() or tmp_final.stat().st_size == 0:
+            raise RuntimeError("intro concat produced an empty/absent file")
+
+        # 4) Atomically replace the caller's clip path with the intro version.
+        os.replace(str(tmp_final), str(video_path))
+        logger.info(
+            f"[INTRO] Prepended {duration:.2f}s thumbnail intro to {video_path.name} "
+            f"(fps={fps:g}, {width}x{height}, {sample_rate}Hz/{channel_layout})"
+        )
+    except Exception as e:  # noqa: BLE001 — intro is best-effort, never fatal
+        logger.warning(
+            f"[INTRO] Could not add thumbnail intro to {video_path.name}; "
+            f"keeping original clip. Reason: {e}"
+        )
+        for p in (intro_file, concat_list, tmp_final):
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
+    finally:
+        # Best-effort cleanup of temp artifacts (current intro version already
+        # replaced video_path, so the intro/concat temp files are no longer needed).
+        for p in (intro_file, concat_list, tmp_final):
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    return video_path

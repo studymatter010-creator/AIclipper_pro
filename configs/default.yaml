@@ -83,7 +83,7 @@ subtitles:
 
 # --- Whisper (Speech Recognition) ---
 whisper:
-  model: "small.en"                  # tiny, base, small, medium, large-v3
+  model: "small"                     # tiny, base, small, medium — small multilingual is the safe default for 16GB RAM
   language: "auto"                   # auto-detect or ISO code (en, es, fr, etc.)
   threads: 4                         # CPU threads for transcription
   beam_size: 5
@@ -113,13 +113,23 @@ face_tracking:
   padding_ratio: 0.15                # Extra padding around face crop
   multi_face_strategy: "largest"     # largest, centered, all
 
-# --- Ollama (Metadata Generation) ---
+# --- Ollama (Metadata Generation / "The Brain") ---
 ollama:
   host: "http://localhost:11434"
-  model: "qwen2"                     # qwen2, llama3, gemma2
+  model: "qwen3:8b"                  # qwen3:8b (default) — best for 16GB; native Chinese + strong structured output
   timeout: 120                       # Request timeout in seconds
   temperature: 0.7
   max_tokens: 500
+
+# --- Model Team (specialists cooperating in sequence) ---
+# Each complex task is delegated to a specialist. The sequencer in
+# backend/services/model_team.py unloads LRU models to stay under the RAM
+# budget so 16GB never OOMs. Specialists share small qwen2.5:3b (fast, zh).
+team:
+  classify: "qwen2.5:3b"             # content-type / density classifier
+  hook: "qwen2.5:3b"                 # snap-hook opening-line extractor
+  translate: "qwen2.5:3b"            # Chinese subtitle translator
+  ram_budget_mb: 9000                # max MB of resident Ollama models
   prompts:
     title: |
       Generate an engaging, attention-grabbing title for a short video clip.

@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<script type="application/json" id="cowork-artifact-meta">
+{
+  "name": "Aiclipper Phase Tracker",
+  "schemaVersion": 1,
+  "description": "AIClipper Phase 0–5 rebuild tracker: audit verdicts, Phase 1 build status, and the roadmap for Phases 2–5."
+}
+</script>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AIClipper — Phase 0–5 Build Tracker</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+    background: #f6f7f9; color: #1b2430; padding: 24px; line-height: 1.45;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; }
+  header { margin-bottom: 20px; }
+  h1 { font-size: 24px; margin: 0 0 4px; }
+  .sub { color: #5b6774; font-size: 14px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin: 16px 0; }
+  @media (max-width: 760px){ .grid { grid-template-columns: 1fr; } }
+  .card { background: #fff; border: 1px solid #e3e7ec; border-radius: 10px; padding: 14px 16px; }
+  .card h3 { margin: 0 0 10px; font-size: 15px; }
+  .stat { display: flex; justify-content: space-between; align-items: center; padding: 7px 0; border-bottom: 1px dashed #eef1f4; }
+  .stat:last-child { border-bottom: 0; }
+  .label { color: #39424e; font-size: 13px; }
+  .value { font-size: 13px; font-weight: 700; }
+  .ok { color: #1a7f37; } .warn { color: #b05e00; } .bad { color: #c0392b; } .mut { color: #7a5af5; }
+  .pill { display: inline-block; padding: 2px 9px; border-radius: 20px; font-size: 12px; font-weight: 600; }
+  .pill.ok { background: #e6f6ec; } .pill.warn { background: #fdf0e1; } .pill.bad { background: #fde8e6; } .pill.mut { background: #efeaff; }
+  table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid #eef1f4; vertical-align: top; }
+  th { color: #5b6774; font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .03em; }
+  code { background: #f0f2f5; padding: 1px 5px; border-radius: 4px; font-size: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .phase { margin: 22px 0; }
+  .phase h2 { font-size: 17px; margin: 0 0 8px; }
+  .note { background: #f0f2f5; border-radius: 8px; padding: 10px 12px; font-size: 13px; color: #39424e; }
+  ul { margin: 6px 0 0; padding-left: 18px; }
+  li { margin: 3px 0; }
+  .footer { margin-top: 26px; color: #8a95a3; font-size: 12px; text-align: center; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>AIClipper — Phase 0–5 Rebuild Tracker</h1>
+    <div class="sub">Audit → Model stack → Semantic clips → Audio Remix → WhisperX source-of-truth → Verification</div>
+  </header>
+
+  <div class="grid">
+    <div class="card">
+      <h3>Overall</h3>
+      <div class="stat"><span class="label">Current phase</span><span class="value mut">Phase 1 (build done)</span></div>
+      <div class="stat"><span class="label">Audit complete</span><span class="value ok">Yes</span></div>
+      <div class="stat"><span class="label">Phase 2–4</span><span class="value warn">Not started</span></div>
+      <div class="stat"><span class="label">Phase 5 (verification run)</span><span class="value bad">Pending</span></div>
+    </div>
+    <div class="card">
+      <h3>Phase 1 runtime status</h3>
+      <div class="stat"><span class="label">Code written</span><span class="value ok">Done (py_compile OK)</span></div>
+      <div class="stat"><span class="label">Deps installed</span><span class="value bad">Not yet</span></div>
+      <div class="stat"><span class="label">Engine logs seen</span><span class="value bad">Not yet</span></div>
+      <div class="stat"><span class="label">Runtime verification</span><span class="value bad">Deferred → Phase 5</span></div>
+    </div>
+  </div>
+
+  <div class="phase">
+    <h2>Phase 0 — Audit verdict</h2>
+    <table>
+      <tr><th>Item</th><th>Status</th><th>Where</th></tr>
+      <tr><td>A1 transcript-reuse-first</td><td><span class="pill ok">already correct</span></td><td><code>auto_editor.py::auto_edit_clip</code> L1622–1652</td></tr>
+      <tr><td>A2 faster-whisper installed</td><td><span class="pill bad">missing</span></td><td>install → Phase 1</td></tr>
+      <tr><td>A3 centisecond ÷100</td><td><span class="pill ok">already correct</span></td><td><code>transcription.py</code> L336–353 + sanity L355–383</td></tr>
+      <tr><td>A4 ASS original_size WxH</td><td><span class="pill ok">already correct</span></td><td><code>auto_editor.py</code> L979–980; ASS still fails on fontconfig → drawtext fallback</td></tr>
+      <tr><td>A5 drawtext/thumb width</td><td><span class="pill ok">already correct</span></td><td><code>auto_editor.py</code> <code>_thumbnail_lines</code> / <code>_wrap_text</code></td></tr>
+      <tr><td>A6 thumb from clean clip</td><td><span class="pill ok">already correct</span></td><td><code>auto_editor.py</code> L1890</td></tr>
+      <tr><td>A7 Chinese captions</td><td><span class="pill warn">partial→needs e2e run</span></td><td>translate+CJK correct; merge-coverage fixed; re-run pending</td></tr>
+    </table>
+  </div>
+
+  <div class="phase">
+    <h2>Phase 1 — Model stack</h2>
+    <table>
+      <tr><th>Requirement</th><th>Status</th><th>Deliverable</th></tr>
+      <tr><td>NLLB-200 translate (CTranslate2)</td><td><span class="pill ok">built</span></td><td><code>nllb_translate.py</code>; NLLB-first in <code>subtitles.py</code></td></tr>
+      <tr><td>faster-whisper large ASR</td><td><span class="pill ok">built</span></td><td>default <code>distil-large-v3</code>; id list extended</td></tr>
+      <tr><td>WhisperX wav2vec2 alignment</td><td><span class="pill ok">built</span></td><td><code>whisperx_align=True</code>; existing <code>_try_whisperx_align</code></td></tr>
+      <tr><td>Demucs htdemucs</td><td><span class="pill ok">built</span></td><td><code>audio_remix.py</code></td></tr>
+      <tr><td>bge-small-en embeddings</td><td><span class="pill ok">built</span></td><td><code>embeddings.py</code></td></tr>
+      <tr><td>Generalized RAM sequencer</td><td><span class="pill ok">built</span></td><td><code>model_team.py</code> register/acquire/release_process</td></tr>
+      <tr><td>DB columns (mode/gains/track)</td><td><span class="pill ok">built</span></td><td><code>models.py</code> + <code>engine.py</code> migration</td></tr>
+      <tr><td>Requirements + install doc</td><td><span class="pill ok">built</span></td><td><code>requirements.txt</code> + <code>PHASE1_INSTALL.md</code></td></tr>
+      <tr><td>Install + run on Windows env</td><td><span class="pill bad">pending</span></td><td>user runs <code>PHASE1_INSTALL.md</code></td></tr>
+    </table>
+    <div class="note">Sandbox has no PyPI + no pydantic → only <code>py_compile</code> verification possible here. Runtime verification must happen on the app's Windows env (Phase 5).</div>
+  </div>
+
+  <div class="phase">
+    <h2>Phase 2 — Semantic-boundary clips <span class="pill bad">not started</span></h2>
+    <ul>
+      <li>Existing frame-level passage analysis stays.</li>
+      <li>WhisperX segments + bge-small-en embeddings → candidate key-sentence anchors → snap to sentence boundary + silence gap.</li>
+      <li>Scoring logic unchanged (retain passage-urgency weighted-sum).</li>
+    </ul>
+  </div>
+
+  <div class="phase">
+    <h2>Phase 3 — Audio Remix <span class="pill bad">module built, not wired</span></h2>
+    <ul>
+      <li>Wire <code>audio_remix.remix_audio</code> into the edit/API pipeline (currently standalone module).</li>
+      <li>Modes keep_original/mute_music/replace_music; local royalty-free only (never copyrighted tracks).</li>
+      <li>Auto-ducking via sidechaincompress; persist vocals_gain/music_gain/replacement_track.</li>
+    </ul>
+  </div>
+
+  <div class="phase">
+    <h2>Phase 4 — WhisperX source-of-truth subtitles <span class="pill bad">not started</span></h2>
+    <ul>
+      <li>WhisperX once on full source → single JSON transcript (segments+words) written to DB.</li>
+      <li>≥90% coverage gate that <b>flags</b> (never marks success).</li>
+      <li>Renderer auto-selects WhisperX; Chinese: reuse + coverage + debug logging + CJK font-confirmation.</li>
+      <li><b>Prerequisite (decision #3):</b> fontconfig-enabled FFmpeg so ASS-success is verifiable — see <code>PHASE1_INSTALL.md</code> §5.</li>
+    </ul>
+  </div>
+
+  <div class="phase">
+    <h2>Phase 5 — Verification <span class="pill bad">not started</span></h2>
+    <ul>
+      <li>Confirm via logs: reuse, alignment, Demucs mode, ASS-success-not-fallback, coverage ≥90%.</li>
+      <li>Visual/audible confirmations (subtitle sync, no garbled text, accurate boundaries).</li>
+      <li>Re-report the Phase 0 audit with every previously-broken item <b>fixed AND verified</b>, not assumed.</li>
+      <li>Task not complete until this output is reported.</li>
+    </ul>
+  </div>
+
+  <div class="footer">Generated 2026-09-11 · Data by build-inspection · Docs: PHASE0_AUDIT.md · PHASE1_INSTALL.md</div>
+</div>
+</body>
+</html>

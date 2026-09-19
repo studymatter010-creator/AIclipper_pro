@@ -68,6 +68,37 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     except Exception as e:
         logger.warning(f"Auto-recovery check failed: {e}")
 
+    # ── Seed BYOK role routing from persisted user settings ───────────────
+    # model_team.chat/chat_json read a small in-memory role_config cache; prime
+    # it from the DB so any previously configured API-provider roles are active
+    # even before the Settings UI is opened.  Roles default to Local/Ollama.
+    try:
+        from backend.database.engine import get_session_context as _gsc
+        from backend.database import crud as _crud
+        from backend.services.llm import role_config
+        async with _gsc() as session:
+            from backend.database.models import User
+            first = (await session.execute(
+                select(User).order_by(User.id.asc()).limit(1)
+            )).scalars().first()
+            if first is not None:
+                role_config.load_from_settings(await _crud.get_all_settings(session, first.id))
+    except Exception as e:
+        logger.warning(f"Could not seed BYOK role config: {e}")
+
+    # ── Transcription engine check ────────────────────────────────────────
+    try:
+        import faster_whisper  # noqa: F401
+        logger.info("Transcription engine: faster-whisper (PRIMARY) ✓")
+    except ImportError:
+        logger.warning(
+            "╔══════════════════════════════════════════════════════════════╗\n"
+            "║  WARNING: faster-whisper is NOT installed.                 ║\n"
+            "║  Subtitles will use the pywhispercpp fallback engine.      ║\n"
+            "║  Install for best quality: pip install faster-whisper      ║\n"
+            "╚══════════════════════════════════════════════════════════════╝"
+        )
+
     logger.info(
         f"AIClipper API started — env={settings.app_env}, "
         f"debug={settings.app_debug}, port={settings.app_port}"
@@ -118,16 +149,22 @@ def create_app() -> FastAPI:
     # Routers
     # ------------------------------------------------------------------
     from backend.api.routes.clips import router as clips_router
+    from backend.api.routes.editor import router as editor_router
     from backend.api.routes.processing import router as processing_router
+    from backend.api.routes.providers import router as providers_router
     from backend.api.routes.publishing import router as publishing_router
     from backend.api.routes.settings import router as settings_router
+    from backend.api.routes.storage import router as storage_router
     from backend.api.routes.videos import router as videos_router
 
     app.include_router(videos_router)
     app.include_router(processing_router)
     app.include_router(clips_router)
+    app.include_router(editor_router)
     app.include_router(publishing_router)
     app.include_router(settings_router)
+    app.include_router(storage_router)
+    app.include_router(providers_router)
 
     # ------------------------------------------------------------------
     # Health-check

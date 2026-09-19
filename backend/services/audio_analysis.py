@@ -120,6 +120,24 @@ def analyze_audio(
         np.arange(len(rms)), sr=sr, hop_length=hop_length
     )
 
+    # ── 3.5. Onset strength (pacing / rhythmic intensity) ─────────────
+    # Counts transient "events" per second in the audio.  High onset density
+    # (rhythmic music, rapid speech, percussion) reads as energetic, fast
+    # pacing — which keeps short-form viewers glued.  This becomes the
+    # ``pacing_score`` signal used by the clip scorer.
+    try:
+        onset_env = librosa.onset.onset_strength(
+            y=y, sr=sr, hop_length=hop_length
+        )
+        on_frames = librosa.onset.onset_detect(
+            onset_envelope=onset_env, sr=sr, hop_length=hop_length
+        )
+        onset_times = librosa.frames_to_time(
+            on_frames, sr=sr, hop_length=hop_length
+        )
+    except Exception:
+        onset_times = np.array([])
+
     # ── 4. Segment-level aggregation ───────────────────────────────────
     n_segments = max(1, int(np.ceil(total_duration / segment_duration)))
 
@@ -128,6 +146,7 @@ def analyze_audio(
     seg_bw_mean = np.zeros(n_segments)
     seg_pitch_std = np.zeros(n_segments)
     seg_energy_std = np.zeros(n_segments)
+    seg_onsets = np.zeros(n_segments)
 
     for i in range(n_segments):
         t_start = i * segment_duration
@@ -146,10 +165,27 @@ def analyze_audio(
         seg_pitch_std[i] = float(np.std(voiced)) if len(voiced) > 2 else 0.0
         seg_energy_std[i] = float(np.std(rms[mask]))
 
+        # Count onset events that fall inside this window.
+        onset_mask = (onset_times >= t_start) & (onset_times < t_end)
+        seg_onsets[i] = float(onset_mask.sum())
+
     # ── 5. Normalise scores ────────────────────────────────────────────
     energy_norm = _safe_normalize(seg_energy)
     pitch_std_norm = _safe_normalize(seg_pitch_std)
     energy_std_norm = _safe_normalize(seg_energy_std)
+    # Onset density, normalised to events-per-second so segment length doesn't
+    # bias the score.  Falls back to energy as a proxy when no onsets found.
+    onset_density = np.zeros(n_segments)
+    ipa = np.zeros(n_segments)
+    for i in range(n_segments):
+        t_start = i * segment_duration
+        t_end = min((i + 1) * segment_duration, total_duration)
+        seg_len = max(t_end - t_start, 0.1)
+        ipa[i] = seg_onsets[i] / seg_len
+    if float(ipa.max()) > 0:
+        onset_density = _safe_normalize(ipa)
+    else:
+        onset_density = energy_norm.copy()
 
     # Emotion intensity ≈ combination of pitch variation and energy dynamics
     emotion_raw = 0.6 * pitch_std_norm + 0.4 * energy_std_norm
@@ -188,6 +224,7 @@ def analyze_audio(
             "laughter_detected": laughter,
             "crowd_reaction": crowd,
             "emotion_intensity": round(float(emotion_norm[i]), 4),
+            "pacing_score": round(float(onset_density[i]), 4),
         })
 
     logger.info(
@@ -196,3 +233,52 @@ def analyze_audio(
         f"{sum(1 for r in results if r['crowd_reaction'])} crowd reactions"
     )
     return results
+
+
+@timed(logger_name="processing")
+def extract_energy_envelope(
+    video_path: Path,
+    window_seconds: float = 0.5,
+) -> list[float]:
+    """
+    Return a per-window RMS energy envelope as a list of floats in [0, 1].
+
+    Used by the auto-editor to make the camera micro-zoom beat-reactive: a
+    fallback that does not need a prior audio pass.  Returns a damped, peak
+    normalized envelope so quiet driving tracks still register motion without
+    blowing out on a single loud spike.
+    """
+    try:
+        import librosa  # type: ignore[import-untyped]
+    except ImportError:
+        return []
+    try:
+        y, sr = librosa.load(str(video_path), sr=None, mono=True)
+    except Exception:
+        return []
+
+    hop_length = 512
+    frame_length = 2048
+    rms = librosa.feature.rms(
+        y=y, frame_length=frame_length, hop_length=hop_length
+    )[0]
+    frame_times = librosa.frames_to_time(
+        np.arange(len(rms)), sr=sr, hop_length=hop_length
+    )
+    total_duration = float(len(y)) / sr
+    if total_duration < 0.1:
+        return []
+
+    n_windows = max(1, int(np.ceil(total_duration / window_seconds)))
+    env = np.zeros(n_windows)
+    for i in range(n_windows):
+        t0 = i * window_seconds
+        t1 = min((i + 1) * window_seconds, total_duration)
+        mask = (frame_times >= t0) & (frame_times < t1)
+        if mask.sum() == 0:
+            continue
+        env[i] = float(np.mean(rms[mask]))
+
+    norm = _safe_normalize(env)
+    # Damp extreme spikes so the zoom reacts to *sections*, not single hits.
+    return [round(float(v), 4) for v in np.clip(norm, 0.0, 0.9)]

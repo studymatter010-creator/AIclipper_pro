@@ -43,6 +43,11 @@ class VideoUploadResponse(BaseModel):
     codec: str | None = Field(None, description="Video codec")
     filesize: int | None = Field(None, description="File size in bytes")
     created_at: datetime = Field(..., description="Upload timestamp")
+    deduped: bool = Field(
+        default=False,
+        description="True when this upload/import matched an existing video and "
+        "no new file was written to disk (deduplicated).",
+    )
 
     model_config = {
         "from_attributes": True,
@@ -64,6 +69,27 @@ class VideoUploadResponse(BaseModel):
             ]
         },
     }
+
+
+class ImportUrlRequest(BaseModel):
+    """Request to import a video from a shareable URL (YouTube/Facebook/etc.)."""
+
+    url: str = Field(..., description="Shareable video URL (YouTube, Facebook, etc.)")
+    project_id: int | None = Field(None, description="Optional project ID")
+    auto_process: bool = Field(True, description="Automatically start processing after download")
+    clip_count: int | None = Field(None, ge=1, le=100, description="Number of clips to generate")
+    clip_duration: int | None = Field(None, ge=20, le=180, description="Preferred clip length in seconds")
+
+
+class ProcessOptions(BaseModel):
+    """Optional tuning controls for the clipping pipeline."""
+
+    clip_count: int | None = Field(
+        None, ge=1, le=100, description="Number of clips to generate"
+    )
+    clip_duration: int | None = Field(
+        None, ge=20, le=180, description="Preferred clip length in seconds"
+    )
 
 
 class TranscriptSchema(BaseModel):
@@ -169,6 +195,10 @@ class VideoDetail(BaseModel):
     status: str
     processing_progress: int = 0
     processing_step: str | None = None
+    current_stage: str | None = None
+    stage_progress: int | None = None
+    content_type: str | None = None
+    content_density: str | None = None
     error_message: str | None = None
     created_at: datetime
     updated_at: datetime | None = None
@@ -188,7 +218,16 @@ class VideoListItem(BaseModel):
     duration: float | None = None
     status: str
     processing_progress: int = 0
+    current_stage: str | None = None
+    stage_progress: int | None = None
     created_at: datetime
+    # Media metadata — populated at ingest; surfaced here so list views can show
+    # resolution / file size / bitrate instead of placeholder "— · ?x?".
+    width: int | None = None
+    height: int | None = None
+    fps: float | None = None
+    bitrate: int | None = None
+    filesize: int | None = None
 
     model_config = {"from_attributes": True}
 
@@ -213,6 +252,8 @@ class ProcessingStatusResponse(BaseModel):
     status: str = Field(..., description="Processing status: pending, processing, completed, failed")
     progress: int = Field(0, description="Processing progress 0-100", ge=0, le=100)
     step: str | None = Field(None, description="Current processing step name")
+    stage: str | None = Field(None, description="Machine-readable active stage key (e.g. 'transcription')")
+    stage_progress: int | None = Field(None, description="0-100 progress within the current stage; null = indeterminate")
     error_message: str | None = Field(None, description="Error message if status is 'failed'")
 
     model_config = {
@@ -234,6 +275,20 @@ class ProcessingStatusResponse(BaseModel):
 # Clip Schemas
 # ---------------------------------------------------------------------------
 
+class ClipEditOut(BaseModel):
+    """A labelled per-language AI edit of a clip."""
+
+    id: int
+    clip_id: int
+    label: str
+    language: str
+    output_path: str | None = None
+    thumbnail_path: str | None = None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
 class ClipResponse(BaseModel):
     """Clip in a list view."""
 
@@ -243,12 +298,22 @@ class ClipResponse(BaseModel):
     start_time: float
     end_time: float
     duration: float
+    achieved_start_time: float | None = None
+    achieved_end_time: float | None = None
     total_score: float | None = None
     title: str | None = None
     description: str | None = None
+    hook_sentence: str | None = None
+    virality_reason: str | None = None
     status: str
     output_path: str | None = None
+    edited_output_path: str | None = None
+    audio_mode: str | None = "keep_original"
+    vocals_gain: float | None = 1.0
+    music_gain: float | None = 1.0
+    replacement_track: str | None = None
     created_at: datetime
+    edits: list[ClipEditOut] = Field(default_factory=list)
 
     model_config = {"from_attributes": True}
 
@@ -270,23 +335,242 @@ class ClipDetailResponse(BaseModel):
     start_time: float
     end_time: float
     duration: float
+    achieved_start_time: float | None = None
+    achieved_end_time: float | None = None
     total_score: float | None = None
     score_breakdown_json: dict[str, Any] | None = None
     title: str | None = None
     description: str | None = None
     hashtags: str | None = None
     keywords: str | None = None
+    hook_sentence: str | None = None
+    virality_reason: str | None = None
     status: str
     output_path: str | None = None
-    
+    edited_output_path: str | None = None
+    audio_mode: str | None = "keep_original"
+    vocals_gain: float | None = 1.0
+    music_gain: float | None = 1.0
+    replacement_track: str | None = None
+
     crop_data_json: list[Any] | None = None
-    
+
     created_at: datetime
     updated_at: datetime | None = None
     subtitles: list[SubtitleSchema] = Field(default_factory=list)
     thumbnails: list[ThumbnailSchema] = Field(default_factory=list)
     uploads: list[UploadSchema] = Field(default_factory=list)
+    edits: list[ClipEditOut] = Field(default_factory=list)
     model_config = {"from_attributes": True}
+
+
+# ---------------------------------------------------------------------------
+# AI Auto-Edit Schemas
+# ---------------------------------------------------------------------------
+
+class AutoEditOptions(BaseModel):
+    """Optional overrides for the minimal AI auto-edit pipeline.
+
+    The editor is intentionally stripped down (2026-09-09 request): it only
+    burns subtitles and generates a thumbnail. No intro, color grading, glow,
+    or AI metadata.
+    """
+
+    with_captions: bool = Field(
+        True,
+        description="Burn subtitles across the entire clip (timed to speech)",
+    )
+    subtitle_language: str = Field(
+        "en",
+        description="Subtitle language: 'en' keeps the original audio language, "
+        "'zh' translates all on-screen subtitles to Simplified Chinese",
+    )
+    # ── Audio Remix (Phase 3) ─────────────────────────────────────────────
+    audio_mode: str = Field(
+        "keep_original",
+        description="Audio mix: 'keep_original' (default) leaves the clip's own "
+        "audio untouched; 'mute_music' removes the background music while keeping "
+        "speech; 'replace_music' swaps in your own music track",
+    )
+    vocals_gain: float = Field(
+        1.0,
+        description="Loudness multiplier applied to the speech/vocals (1.0 = no change)",
+    )
+    music_gain: float = Field(
+        1.0,
+        description="Loudness multiplier applied to the background music (1.0 = no change)",
+    )
+    replacement_track: str | None = Field(
+        None,
+        description="Absolute path to YOUR OWN music file (song/royalty-free) used "
+        "when audio_mode='replace_music'. Must exist locally.",
+    )
+    # ── Subtitle STYLE (Part A) ───────────────────────────────────────────
+    # Applied to the real caption burn (drawtext path) so the live preview in
+    # the editor matches the rendered output.
+    subtitle_style: str = Field(
+        "fancy",
+        description="Subtitle style preset: 'fancy' (karaoke glow), 'normal' "
+        "(plain clean), 'bold' (big heavy captions)",
+    )
+    caption_font: str | None = Field(
+        None,
+        description="Caption font family name (e.g. 'Arial'). Mapped to a Windows "
+        "font path on the backend; must be in the confirmed-available list.",
+    )
+    caption_color: str | None = Field(
+        None,
+        description="Caption/accent text colour as '#RRGGBB'.",
+    )
+    caption_highlight: str | None = Field(
+        None,
+        description="Highlight/accent colour for karaoke effects as '#RRGGBB'.",
+    )
+    caption_size_scale: float = Field(
+        1.0,
+        description="Font-size multiplier for captions (0.6–1.8). Applied on top "
+        "of the auto-fit size so long lines still stay on-canvas.",
+    )
+    caption_position: str = Field(
+        "bottom",
+        description="Vertical caption position: 'bottom' | 'top' | 'center'.",
+    )
+    caption_outline: bool = Field(
+        True,
+        description="Draw a strong outline/drop shadow behind caption text.",
+    )
+    # ── Thumbnail STYLE (Part B) ──────────────────────────────────────────
+    thumbnail_style: dict | None = Field(
+        None,
+        description="Thumbnail override flags forwarded to the thumbnail engine. "
+        "Keys: 'template' ('full_bleed'|'minimal'), 'headline' (override text), "
+        "'frame_index' (override the auto-picked frame), plus compositor design "
+        "tokens like 'cta_show'/'cta_fill'.",
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "with_captions": True,
+                    "subtitle_language": "en",
+                }
+            ]
+        }
+    }
+
+
+# ---------------------------------------------------------------------------
+# AI Voice-Over (Dubbing) Schemas
+# ---------------------------------------------------------------------------
+
+class VoiceInfo(BaseModel):
+    """A single neural voice offered for a language."""
+
+    id: str = Field(..., description="edge-tts voice tag, e.g. 'en-US-JennyNeural'")
+    label: str = Field(..., description="Human-readable display label")
+    gender: str = Field(..., description="'male' or 'female'")
+
+
+class VoiceLanguage(BaseModel):
+    """A supported language with its selectable voices."""
+
+    code: str = Field(..., description="ISO code: en | ko | hi | ja | zh")
+    name: str = Field(..., description="Human-readable language name")
+    flag: str = Field(..., description="Emoji flag for the UI")
+    default_voice: str = Field(..., description="Recommended default voice tag")
+    voices: list[VoiceInfo] = Field(default_factory=list)
+
+
+class VoicesResponse(BaseModel):
+    """Catalog of supported languages and neural voices."""
+
+    languages: list[VoiceLanguage] = Field(default_factory=list)
+
+
+class DubRequest(BaseModel):
+    """Request to generate a multilingual AI voice-over for a clip."""
+
+    clip_id: int = Field(..., description="ID of the clip to dub")
+    language: str = Field(
+        ...,
+        description="Target language: 'en' | 'ko' | 'hi' | 'ja' | 'zh'",
+    )
+    voice: str | None = Field(
+        None,
+        description="edge-tts voice tag; defaults to the language default",
+    )
+    mode: str = Field(
+        "replace",
+        description="'replace' swaps audio, 'mix' layers voice-over on top",
+    )
+    mix_volume: float = Field(
+        1.0,
+        ge=0.0,
+        le=3.0,
+        description="Loudness of the voice-over when mode='mix'",
+    )
+    translate: bool = Field(
+        True,
+        description="Attempt to translate the script to the target language",
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "clip_id": 3,
+                    "language": "ko",
+                    "voice": "ko-KR-SunHiNeural",
+                    "mode": "replace",
+                    "mix_volume": 1.0,
+                    "translate": True,
+                }
+            ]
+        }
+    }
+
+
+class VoiceOverSchema(BaseModel):
+    """A persisted AI voice-over render."""
+
+    id: int
+    clip_id: int
+    language: str
+    voice: str
+    mode: str
+    status: str
+    source_text: str | None = None
+    translated_text: str | None = None
+    translated: int = 0
+    audio_path: str | None = None
+    output_path: str | None = None
+    error_message: str | None = None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class VoiceOverListResponse(BaseModel):
+    """List of voice-overs for a clip."""
+
+    voiceovers: list[VoiceOverSchema] = Field(default_factory=list)
+    total: int = 0
+
+
+class DubResponse(BaseModel):
+    """Response after generating a voice-over."""
+
+    id: int
+    clip_id: int
+    language: str
+    voice: str
+    mode: str
+    translated: bool = False
+    output_path: str | None = None
+    audio_path: str | None = None
+    status: str = "completed"
+    message: str = "Voice-over generated successfully."
 
 
 # ---------------------------------------------------------------------------

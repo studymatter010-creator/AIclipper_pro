@@ -1,0 +1,53 @@
+# AIClipper runtime dependencies
+# Install with:  pip install -r requirements.txt
+fastapi[standard]>=0.136
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9
+aiofiles>=24.1
+sqlalchemy[asyncio]>=2.0
+alembic>=1.13
+aiosqlite>=0.20
+huey>=2.5
+peewee>=3.17
+scenedetect>=0.7
+opencv-python>=4.10
+pywhispercpp>=1.5
+faster-whisper>=1.1.0
+# Optional: WhisperX forced alignment (wav2vec2) for sharper word timestamps.
+# OFF by default (WHISPERX_ALIGN) to protect RAM on 16GB machines. Requires
+# torch — install explicitly if you want it:  pip install "whisperx" torch
+# whisperx>=3.1.1
+# torch>=2.2
+mediapipe>=0.10.14
+librosa>=0.10
+ollama>=0.3
+edge-tts>=6.1
+yt-dlp>=2024.10.0
+google-api-python-client>=2.140
+google-auth-oauthlib>=1.2
+google-auth-httplib2>=0.2
+requests>=2.32
+pydantic>=2.8
+pydantic-settings>=2.4
+pyyaml>=6.0
+python-dotenv>=1.0
+pillow>=10.4
+numpy>=1.26
+websockets>=12.0
+
+# ── PHASE 1 (2026-09-11) model-stack additions ─────────────────────────
+# NLLB-200 translation (replaces Ollama translate specialist) via CTranslate2.
+ctranslate2>=4.4
+sentencepiece>=0.2
+# WhisperX forced-alignment ASR (source-of-truth word timestamps).
+# OFF by default. NOTE: whisperx 3.2.0 pins faster-whisper==1.0.0 which
+# conflicts with our faster-whisper>=1.1.0, so it is kept DISABLED. If you
+# really want it, install it in a separate venv with Python 3.10-3.12.
+# whisperx>=3.1.1
+torch>=2.2
+torchaudio>=2.2
+# Demucs: htdemucs vocal/music stem separation (Audio Remix).
+# Latest demucs installs own torch backend; keep it consistent with torch above.
+demucs>=4.0
+# bge-small-en sentence embedder (Phase 2 semantic clip boundaries).
+sentence-transformers>=3.0

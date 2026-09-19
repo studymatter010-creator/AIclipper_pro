@@ -1,0 +1,16 @@
+{
+  "name": "aiclipper",
+  "version": "1.0.0",
+  "private": true,
+  "description": "AI-powered local video clipping platform (FastAPI backend + vanilla-JS frontend). `npm run dev` boots the entire stack.",
+  "license": "MIT",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "start": "node scripts/dev.mjs",
+    "worker": "node scripts/dev.mjs worker",
+    "server": "node scripts/dev.mjs server",
+    "models": "node scripts/dev.mjs models",
+    "check": "node scripts/dev.mjs check"
+  },
+  "dependencies": {}
+}

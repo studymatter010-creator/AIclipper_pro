@@ -15,6 +15,7 @@ from sqlalchemy.orm import selectinload
 
 from backend.database.models import (
     Clip,
+    ClipEdit,
     ClipStatus,
     Platform,
     Project,
@@ -30,6 +31,8 @@ from backend.database.models import (
     User,
     Video,
     VideoStatus,
+    VoiceOver,
+    VoiceOverStatus,
 )
 
 
@@ -50,7 +53,7 @@ async def get_user(session: AsyncSession, user_id: int) -> User | None:
 
 async def get_user_by_username(session: AsyncSession, username: str) -> User | None:
     result = await session.execute(select(User).where(User.username == username))
-    return result.scalar_one_or_none()
+    return result.scalars().first()
 
 
 async def get_or_create_default_user(session: AsyncSession) -> User:
@@ -144,7 +147,7 @@ async def get_video_with_relations(session: AsyncSession, video_id: int) -> Vide
         )
         .where(Video.id == video_id)
     )
-    return result.scalar_one_or_none()
+    return result.scalars().first()
 
 
 async def list_videos(
@@ -164,6 +167,9 @@ async def list_videos(
     return result.scalars().all()
 
 
+_UNSET = object()
+
+
 async def update_video_status(
     session: AsyncSession,
     video_id: int,
@@ -171,6 +177,8 @@ async def update_video_status(
     progress: int | None = None,
     step: str | None = None,
     error: str | None = None,
+    stage: str | None = None,
+    stage_progress: int | None = _UNSET,
 ) -> None:
     values: dict[str, Any] = {"status": status}
     if progress is not None:
@@ -179,7 +187,86 @@ async def update_video_status(
         values["processing_step"] = step
     if error is not None:
         values["error_message"] = error
+    if stage is not None:
+        values["current_stage"] = stage
+    # stage_progress is written whenever explicitly passed (even NULL, to clear a
+    # previously-set value); _UNSET means "leave the DB value untouched".
+    if stage_progress is not _UNSET:
+        values["stage_progress"] = stage_progress
     await session.execute(update(Video).where(Video.id == video_id).values(**values))
+
+
+async def update_video(session: AsyncSession, video_id: int, **kwargs: Any) -> Video | None:
+    """Update arbitrary fields on a video row (e.g. content_type, content_density)."""
+    video = await get_video(session, video_id)
+    if video:
+        for key, value in kwargs.items():
+            setattr(video, key, value)
+        await session.flush()
+    return video
+
+
+async def get_videos_by_hash(session: AsyncSession, content_hash: str) -> Sequence[Video]:
+    """Return rows whose source file matched ``content_hash`` (upload dedup)."""
+    result = await session.execute(
+        select(Video).where(Video.content_hash == content_hash)
+    )
+    return result.scalars().all()
+
+
+async def get_video_by_source_id(session: AsyncSession, source_video_id: str) -> Video | None:
+    """Return the newest row imported from platform source id (URL dedup)."""
+    result = await session.execute(
+        select(Video)
+        .where(Video.source_video_id == source_video_id)
+        .order_by(Video.id.desc())
+    )
+    return result.scalars().first()
+
+
+async def delete_video(session: AsyncSession, video_id: int) -> bool:
+    """Delete a video row and (via ORM cascade) all its derived rows.
+
+    DB-only — callers are responsible for removing files from disk.  Returns
+    True if a row was deleted, False if it didn't exist.
+    """
+    result = await session.execute(delete(Video).where(Video.id == video_id))
+    return bool(result.rowcount)
+
+
+async def get_db_referenced_files(session: AsyncSession) -> set[str]:
+    """Return every file-path string referenced by any DB row.
+
+    Used by the orphan-file scan: any file on disk under a managed storage dir
+    whose path is NOT in this set (after path resolution) is an orphan.  Paths
+    are returned exactly as stored (possibly relative); callers resolve them
+    against PROJECT_ROOT before comparing with real disk files.
+
+    Covers: ``videos.filepath``, ``clips.output_path``/``edited_output_path``,
+    ``clip_edits.output_path``/``thumbnail_path``, ``subtitles.filepath``,
+    ``thumbnails.filepath``, and ``voiceovers.audio_path``/``output_path``.
+    """
+    referenced: set[str] = set()
+    queries = [
+        select(Video.filepath),
+        select(Clip.output_path),
+        select(Clip.edited_output_path),
+        select(ClipEdit.output_path),
+        select(ClipEdit.thumbnail_path),
+        select(Subtitle.filepath),
+        select(Thumbnail.filepath),
+        select(VoiceOver.audio_path),
+        select(VoiceOver.output_path),
+    ]
+    for stmt in queries:
+        try:
+            result = await session.execute(stmt)
+        except Exception:  # noqa: BLE001 — a missing model/column must not crash the scan
+            continue
+        for (p,) in result.all():
+            if p:  # skip NULL / empty
+                referenced.add(p)
+    return referenced
 
 
 # ===========================================================================
@@ -210,7 +297,7 @@ async def get_transcript_for_video(session: AsyncSession, video_id: int) -> Tran
     result = await session.execute(
         select(Transcript).where(Transcript.video_id == video_id).order_by(Transcript.id.desc())
     )
-    return result.scalar_one_or_none()
+    return result.scalars().first()
 
 
 # ===========================================================================
@@ -284,10 +371,11 @@ async def get_clip_with_relations(session: AsyncSession, clip_id: int) -> Clip |
             selectinload(Clip.subtitles),
             selectinload(Clip.thumbnails),
             selectinload(Clip.uploads),
+            selectinload(Clip.edits),
         )
         .where(Clip.id == clip_id)
     )
-    return result.scalar_one_or_none()
+    return result.scalars().first()
 
 
 async def list_clips(
@@ -297,7 +385,11 @@ async def list_clips(
     offset: int = 0,
     limit: int = 50,
 ) -> Sequence[Clip]:
-    query = select(Clip).order_by(Clip.total_score.desc().nullslast())
+    query = (
+        select(Clip)
+        .options(selectinload(Clip.edits))
+        .order_by(Clip.total_score.desc().nullslast())
+    )
     if video_id is not None:
         query = query.where(Clip.video_id == video_id)
     if status is not None:
@@ -319,6 +411,37 @@ async def update_clip(session: AsyncSession, clip_id: int, **kwargs: Any) -> Cli
 async def delete_clip(session: AsyncSession, clip_id: int) -> bool:
     result = await session.execute(delete(Clip).where(Clip.id == clip_id))
     return result.rowcount > 0
+
+
+# ===========================================================================
+# ClipEdit CRUD (labelled per-language AI edits of a clip)
+# ===========================================================================
+
+async def create_clip_edit(
+    session: AsyncSession,
+    clip_id: int,
+    label: str,
+    language: str,
+    output_path: str,
+    thumbnail_path: str | None = None,
+) -> ClipEdit:
+    edit = ClipEdit(
+        clip_id=clip_id,
+        label=label,
+        language=language,
+        output_path=output_path,
+        thumbnail_path=thumbnail_path,
+    )
+    session.add(edit)
+    await session.flush()
+    return edit
+
+
+async def list_clip_edits(session: AsyncSession, clip_id: int) -> Sequence[ClipEdit]:
+    result = await session.execute(
+        select(ClipEdit).where(ClipEdit.clip_id == clip_id).order_by(ClipEdit.id)
+    )
+    return result.scalars().all()
 
 
 # ===========================================================================
@@ -377,7 +500,63 @@ async def get_selected_thumbnail(session: AsyncSession, clip_id: int) -> Thumbna
         select(Thumbnail)
         .where(Thumbnail.clip_id == clip_id, Thumbnail.is_selected == 1)
     )
-    return result.scalar_one_or_none()
+    return result.scalars().first()
+
+
+# ===========================================================================
+# VoiceOver CRUD
+# ===========================================================================
+
+async def create_voiceover(
+    session: AsyncSession,
+    clip_id: int,
+    language: str,
+    voice: str,
+    mode: str = "replace",
+    source_text: str | None = None,
+) -> VoiceOver:
+    vo = VoiceOver(
+        clip_id=clip_id,
+        language=language,
+        voice=voice,
+        mode=mode,
+        source_text=source_text,
+        status=VoiceOverStatus.PENDING,
+    )
+    session.add(vo)
+    await session.flush()
+    return vo
+
+
+async def get_voiceover(session: AsyncSession, voiceover_id: int) -> VoiceOver | None:
+    return await session.get(VoiceOver, voiceover_id)
+
+
+async def get_voiceovers_for_clip(
+    session: AsyncSession, clip_id: int
+) -> Sequence[VoiceOver]:
+    result = await session.execute(
+        select(VoiceOver)
+        .where(VoiceOver.clip_id == clip_id)
+        .order_by(VoiceOver.created_at.desc())
+    )
+    return result.scalars().all()
+
+
+async def update_voiceover(
+    session: AsyncSession, voiceover_id: int, **kwargs: Any
+) -> VoiceOver | None:
+    vo = await get_voiceover(session, voiceover_id)
+    if vo:
+        for key, value in kwargs.items():
+            setattr(vo, key, value)
+        await session.flush()
+    return vo
+
+
+async def delete_voiceover(session: AsyncSession, voiceover_id: int) -> bool:
+    result = await session.execute(delete(VoiceOver).where(VoiceOver.id == voiceover_id))
+    return result.rowcount > 0
 
 
 # ===========================================================================
@@ -437,15 +616,57 @@ async def get_setting(session: AsyncSession, user_id: int, key: str) -> Any:
     result = await session.execute(
         select(Setting).where(Setting.user_id == user_id, Setting.key == key)
     )
-    setting = result.scalar_one_or_none()
+    setting = result.scalars().first()
     return setting.value_json if setting else None
+
+
+async def get_setting_any(session: AsyncSession, key: str) -> Any:
+    """Read a setting value regardless of which user owns it.
+
+    Used by background pipeline code (e.g. auto-delete-source) that has no
+    request/user context.  In this effectively single-user app any owner is
+    fine.  Returns ``None`` if no row exists for the key.
+    """
+    result = await session.execute(
+        select(Setting)
+        .where(Setting.key == key)
+        .order_by(Setting.id.desc())
+    )
+    setting = result.scalars().first()
+    return setting.value_json if setting else None
+
+
+async def get_intro_setting(session: AsyncSession) -> tuple[bool, float]:
+    """Resolve the "Add thumbnail as intro frame" toggle + duration.
+
+    Returns ``(enabled, duration_seconds)`` with defaults ``(False, 0.8)``.
+    Handles both a real bool/float and the JSON-string form ("true"/"0.8")
+    depending on how the frontend serialized the value.
+    """
+    on_raw = await get_setting_any(session, "intro_frame")
+    dur_raw = await get_setting_any(session, "intro_duration")
+
+    # Default OFF when unset (user must opt in).
+    if on_raw is None:
+        enabled = False
+    elif isinstance(on_raw, bool):
+        enabled = on_raw
+    else:
+        enabled = str(on_raw).strip().lower() in ("1", "true", "yes", "on")
+
+    try:
+        duration = float(dur_raw) if dur_raw not in (None, "") else 0.8
+    except (TypeError, ValueError):
+        duration = 0.8
+
+    return enabled, duration
 
 
 async def set_setting(session: AsyncSession, user_id: int, key: str, value: Any) -> Setting:
     result = await session.execute(
         select(Setting).where(Setting.user_id == user_id, Setting.key == key)
     )
-    setting = result.scalar_one_or_none()
+    setting = result.scalars().first()
     if setting:
         setting.value_json = value
     else:
